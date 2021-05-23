@@ -13,14 +13,19 @@
 #include <sys/resource.h>
 #include <getopt.h>
 #include <syslog.h>
+#include <sys/ioctl.h>
+#ifdef CONFIG_DARWIN
+#include <unistd.h>
+#include <sys/xattr.h>
+#else
 #include <sys/fsuid.h>
 #include <sys/vfs.h>
-#include <sys/ioctl.h>
 #include <linux/fs.h>
+#include <cap-ng.h>
+#endif
 #ifdef CONFIG_LINUX_MAGIC_H
 #include <linux/magic.h>
 #endif
-#include <cap-ng.h>
 #include "qemu-common.h"
 #include "qemu/sockets.h"
 #include "qemu/xattr.h"
@@ -81,6 +86,7 @@ static void do_perror(const char *string)
 
 static int init_capabilities(void)
 {
+#ifndef CONFIG_DARWIN
     /* helper needs following capabilities only */
     int cap_list[] = {
         CAP_CHOWN,
@@ -118,6 +124,8 @@ static int init_capabilities(void)
             return -1;
         }
     }
+#endif
+
     return 0;
 }
 
@@ -263,6 +271,71 @@ static int send_status(int sockfd, struct iovec *iovec, int status)
     return 0;
 }
 
+#ifdef CONFIG_DARWIN
+/*
+ * from man 7 capabilities, section
+ * Effect of User ID Changes on Capabilities:
+ * If the effective user ID is changed from nonzero to 0, then the permitted
+ * set is copied to the effective set.  If the effective user ID is changed
+ * from 0 to nonzero, then all capabilities are are cleared from the effective
+ * set.
+ *
+ * The setfsuid/setfsgid man pages warn that changing the effective user ID may
+ * expose the program to unwanted signals, but this is not true anymore: for an
+ * unprivileged (without CAP_KILL) program to send a signal, the real or
+ * effective user ID of the sending process must equal the real or saved user
+ * ID of the target process.  Even when dropping privileges, it is enough to
+ * keep the saved UID to a "privileged" value and virtfs-proxy-helper won't
+ * be exposed to signals.  So just use setresuid/setresgid.
+ */
+static int setugid(int uid, int gid, int *suid, int *sgid)
+{
+    int retval;
+
+    *suid = geteuid();
+    *sgid = getegid();
+
+    if (setregid(-1, gid) == -1) {
+        return -errno;
+    }
+
+    if (setreuid(-1, uid) == -1) {
+        retval = -errno;
+        goto err_sgid;
+    }
+
+    if (uid == 0 && gid == 0) {
+        /* Linux has already copied the permitted set to the effective set.  */
+        return 0;
+    }
+
+    return 0;
+
+err_suid:
+    if (setreuid(-1, *suid) == -1) {
+        abort();
+    }
+err_sgid:
+    if (setregid(-1, *sgid) == -1) {
+        abort();
+    }
+    return retval;
+}
+
+/*
+ * This is used to reset the ugid back with the saved values
+ * There is nothing much we can do checking error values here.
+ */
+static void resetugid(int suid, int sgid)
+{
+    if (setregid(-1, sgid) == -1) {
+        abort();
+    }
+    if (setreuid(-1, suid) == -1) {
+        abort();
+    }
+}
+#else
 /*
  * from man 7 capabilities, section
  * Effect of User ID Changes on Capabilities:
@@ -337,6 +410,7 @@ static void resetugid(int suid, int sgid)
         abort();
     }
 }
+#endif
 
 /*
  * send response in two parts
@@ -445,7 +519,11 @@ static int do_getxattr(int type, struct iovec *iovec, struct iovec *out_iovec)
         v9fs_string_init(&name);
         retval = proxy_unmarshal(iovec, offset, "s", &name);
         if (retval > 0) {
+#ifdef CONFIG_DARWIN
+            retval = getxattr(path.data, name.data, xattr.data, size, 0, XATTR_NOFOLLOW);
+#else
             retval = lgetxattr(path.data, name.data, xattr.data, size);
+#endif
             if (retval < 0) {
                 retval = -errno;
             } else {
@@ -455,7 +533,11 @@ static int do_getxattr(int type, struct iovec *iovec, struct iovec *out_iovec)
         v9fs_string_free(&name);
         break;
     case T_LLISTXATTR:
+#ifdef CONFIG_DARWIN
+        retval = listxattr(path.data, xattr.data, size, XATTR_NOFOLLOW);
+#else
         retval = llistxattr(path.data, xattr.data, size);
+#endif
         if (retval < 0) {
             retval = -errno;
         } else {
@@ -492,14 +574,24 @@ static void stat_to_prstat(ProxyStat *pr_stat, struct stat *stat)
     pr_stat->st_size = stat->st_size;
     pr_stat->st_blksize = stat->st_blksize;
     pr_stat->st_blocks = stat->st_blocks;
+#ifdef CONFIG_DARWIN
+    pr_stat->st_atim_sec = stat->st_atimespec.tv_sec;
+    pr_stat->st_atim_nsec = stat->st_atimespec.tv_nsec;
+    pr_stat->st_mtim_sec = stat->st_mtimespec.tv_sec;
+    pr_stat->st_mtim_nsec = stat->st_mtimespec.tv_nsec;
+    pr_stat->st_ctim_sec = stat->st_ctimespec.tv_sec;
+    pr_stat->st_ctim_nsec = stat->st_ctimespec.tv_nsec;
+#else
     pr_stat->st_atim_sec = stat->st_atim.tv_sec;
     pr_stat->st_atim_nsec = stat->st_atim.tv_nsec;
     pr_stat->st_mtim_sec = stat->st_mtim.tv_sec;
     pr_stat->st_mtim_nsec = stat->st_mtim.tv_nsec;
     pr_stat->st_ctim_sec = stat->st_ctim.tv_sec;
     pr_stat->st_ctim_nsec = stat->st_ctim.tv_nsec;
+#endif
 }
 
+#ifndef CONFIG_DARWIN
 static void statfs_to_prstatfs(ProxyStatFS *pr_stfs, struct statfs *stfs)
 {
     memset(pr_stfs, 0, sizeof(*pr_stfs));
@@ -515,6 +607,7 @@ static void statfs_to_prstatfs(ProxyStatFS *pr_stfs, struct statfs *stfs)
     pr_stfs->f_namelen = stfs->f_namelen;
     pr_stfs->f_frsize = stfs->f_frsize;
 }
+#endif
 
 /*
  * Gets stat/statfs information and packs in out_iovec structure
@@ -526,9 +619,11 @@ static int do_stat(int type, struct iovec *iovec, struct iovec *out_iovec)
     int retval;
     V9fsString path;
     ProxyStat pr_stat;
-    ProxyStatFS pr_stfs;
     struct stat st_buf;
+#ifndef CONFIG_DARWIN
+    ProxyStatFS pr_stfs;
     struct statfs stfs_buf;
+#endif
 
     v9fs_string_init(&path);
     retval = proxy_unmarshal(iovec, PROXY_HDR_SZ, "s", &path);
@@ -556,6 +651,9 @@ static int do_stat(int type, struct iovec *iovec, struct iovec *out_iovec)
         }
         break;
     case T_STATFS:
+#ifdef CONFIG_DARWIN
+        retval = -errno;
+#else
         retval = statfs(path.data, &stfs_buf);
         if (retval < 0) {
             retval = -errno;
@@ -569,6 +667,7 @@ static int do_stat(int type, struct iovec *iovec, struct iovec *out_iovec)
                                    pr_stfs.f_fsid[0], pr_stfs.f_fsid[1],
                                    pr_stfs.f_namelen, pr_stfs.f_frsize);
         }
+#endif
         break;
     }
     v9fs_string_free(&path);
@@ -978,8 +1077,13 @@ static int process_requests(int sock)
             retval = proxy_unmarshal(&in_iovec, PROXY_HDR_SZ, "sssdd", &path,
                                      &name, &value, &size, &flags);
             if (retval > 0) {
+#ifdef CONFIG_DARWIN
+                retval = setxattr(path.data,
+                                  name.data, value.data, size, 0, flags | XATTR_NOFOLLOW);
+#else
                 retval = lsetxattr(path.data,
                                    name.data, value.data, size, flags);
+#endif
                 if (retval < 0) {
                     retval = -errno;
                 }
@@ -994,7 +1098,11 @@ static int process_requests(int sock)
             retval = proxy_unmarshal(&in_iovec,
                                      PROXY_HDR_SZ, "ss", &path, &name);
             if (retval > 0) {
+#ifdef CONFIG_DARWIN
+                retval = removexattr(path.data, name.data, XATTR_NOFOLLOW);
+#else
                 retval = lremovexattr(path.data, name.data);
+#endif
                 if (retval < 0) {
                     retval = -errno;
                 }
